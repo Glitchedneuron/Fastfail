@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 
 from .base import CorpusResult
 from framework.config import TrainingConfig
+from framework.data.packing import PackedDataset
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +134,19 @@ class DataPipeline:
 
         seq_len = self.model_cfg.max_seq_len
 
-        train_ds = TextDataset(train_texts, tokenizer, seq_len=seq_len, stride=seq_len // 4, split_name="train")
-        val_ds = TextDataset(val_texts, tokenizer, seq_len=seq_len, stride=seq_len, split_name="val")
-        test_ds = TextDataset(test_texts, tokenizer, seq_len=seq_len, stride=seq_len, split_name="test")
+        if self.cfg.use_packing:
+            logger.info(
+                "Sequence packing enabled — building PackedDataset "
+                "(zero padding, ~1.4–2× throughput vs. sliding-window)"
+            )
+            train_ds = PackedDataset(train_texts, tokenizer, seq_len=seq_len, split_name="train")
+            val_ds   = PackedDataset(val_texts,   tokenizer, seq_len=seq_len, split_name="val")
+            test_ds  = PackedDataset(test_texts,  tokenizer, seq_len=seq_len, split_name="test")
+        else:
+            logger.info("Sequence packing disabled — using sliding-window TextDataset")
+            train_ds = TextDataset(train_texts, tokenizer, seq_len=seq_len, stride=seq_len // 4, split_name="train")
+            val_ds   = TextDataset(val_texts,   tokenizer, seq_len=seq_len, stride=seq_len,      split_name="val")
+            test_ds  = TextDataset(test_texts,  tokenizer, seq_len=seq_len, stride=seq_len,      split_name="test")
 
         train_loader = DataLoader(
             train_ds,

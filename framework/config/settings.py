@@ -142,6 +142,9 @@ class TrainingConfig:
     val_split: float = 0.10
     test_split: float = 0.05        # must sum to 1.0
 
+    # Sequence packing (eliminates padding waste, ~1.4–2× throughput boost)
+    use_packing: bool = True
+
 
 @dataclass
 class LoRAConfig:

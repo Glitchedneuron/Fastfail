@@ -119,19 +119,22 @@ class ModelExporter:
         Convert to GGUF format using llama.cpp's convert script.
 
         Steps:
-          1. Save model as safetensors (needed by convert script)
-          2. Call convert_hf_to_gguf.py
-          3. Optionally quantise with llama-quantize
+          1. Remap weight keys to LLaMA HuggingFace naming convention
+          2. Save remapped weights as safetensors inside an HF-format directory
+          3. Write a LlamaConfig-compatible config.json
+          4. Call convert_hf_to_gguf.py
+          5. Optionally quantise with llama-quantize
 
         If llama.cpp is not available, saves a plain .pt and prints
         instructions for manual conversion.
         """
-        # First ensure we have a safetensors checkpoint
         hf_dir = self.out_dir / "hf_checkpoint"
         hf_dir.mkdir(exist_ok=True)
-        self._export_safetensors()
+
+        # Remap weight names and save as safetensors in the HF checkpoint dir
+        self._save_remapped_safetensors(hf_dir)
         self._save_tokenizer(save_dir=hf_dir)
-        self._save_model_config(save_dir=hf_dir)
+        self._save_llama_config(save_dir=hf_dir)
 
         # Try using llama-cpp-python's bundled convert utilities
         gguf_path = self.out_dir / "model.gguf"
@@ -246,6 +249,157 @@ class ModelExporter:
             logger.info(f"Config → {config_path}")
         except Exception as e:
             logger.warning(f"Config save failed: {e}")
+
+    # ------------------------------------------------------------------
+    # GGUF helpers: weight remapping + LlamaConfig generation
+    # ------------------------------------------------------------------
+
+    def _remap_weights_for_gguf(self) -> dict:
+        """
+        Rename internal weight keys to the LLaMA HuggingFace convention that
+        ``convert_hf_to_gguf.py`` expects.
+
+        Our internal naming (from TransformerLM):
+            embed_tokens.weight
+            layers.{i}.attn_norm.weight
+            layers.{i}.attn.q_proj.weight
+            layers.{i}.attn.k_proj.weight
+            layers.{i}.attn.v_proj.weight
+            layers.{i}.attn.o_proj.weight
+            layers.{i}.ffn_norm.weight
+            layers.{i}.ffn.gate_proj.weight
+            layers.{i}.ffn.up_proj.weight
+            layers.{i}.ffn.down_proj.weight
+            norm.weight
+            lm_head.weight
+
+        Target HuggingFace LLaMA naming:
+            model.embed_tokens.weight
+            model.layers.{i}.input_layernorm.weight
+            model.layers.{i}.self_attn.q_proj.weight
+            model.layers.{i}.self_attn.k_proj.weight
+            model.layers.{i}.self_attn.v_proj.weight
+            model.layers.{i}.self_attn.o_proj.weight
+            model.layers.{i}.post_attention_layernorm.weight
+            model.layers.{i}.mlp.gate_proj.weight
+            model.layers.{i}.mlp.up_proj.weight
+            model.layers.{i}.mlp.down_proj.weight
+            model.norm.weight
+            lm_head.weight
+        """
+        import re
+
+        state = self.model.state_dict()
+        remapped: dict = {}
+        skipped: list = []
+
+        # Static single-key renames
+        _static = {
+            "embed_tokens.weight": "model.embed_tokens.weight",
+            "norm.weight":         "model.norm.weight",
+            "lm_head.weight":      "lm_head.weight",
+        }
+
+        # Per-layer rename rules: (regex pattern, replacement template)
+        _layer_rules = [
+            # Attention norms
+            (r"^layers\.(\d+)\.attn_norm\.weight$",
+             r"model.layers.\1.input_layernorm.weight"),
+            # Attention projections
+            (r"^layers\.(\d+)\.attn\.(q_proj|k_proj|v_proj|o_proj)\.weight$",
+             r"model.layers.\1.self_attn.\2.weight"),
+            # FFN norms
+            (r"^layers\.(\d+)\.ffn_norm\.weight$",
+             r"model.layers.\1.post_attention_layernorm.weight"),
+            # FFN projections
+            (r"^layers\.(\d+)\.ffn\.(gate_proj|up_proj|down_proj)\.weight$",
+             r"model.layers.\1.mlp.\2.weight"),
+        ]
+
+        for old_key, tensor in state.items():
+            # Skip non-persistent buffers (e.g. _freqs)
+            if old_key.startswith("_"):
+                skipped.append(old_key)
+                continue
+
+            # Static renames
+            if old_key in _static:
+                remapped[_static[old_key]] = tensor
+                continue
+
+            # Pattern-based layer renames
+            matched = False
+            for pattern, replacement in _layer_rules:
+                new_key, n_subs = re.subn(pattern, replacement, old_key)
+                if n_subs > 0:
+                    remapped[new_key] = tensor
+                    matched = True
+                    break
+
+            if not matched:
+                logger.warning(f"GGUF remap: no rule for key '{old_key}' — keeping as-is")
+                remapped[old_key] = tensor
+
+        if skipped:
+            logger.debug(f"GGUF remap: skipped buffers: {skipped}")
+
+        logger.info(
+            f"GGUF remap: {len(state)} internal keys → {len(remapped)} HF keys "
+            f"({len(skipped)} buffers skipped)"
+        )
+        return remapped
+
+    def _save_remapped_safetensors(self, save_dir: Path) -> None:
+        """Save GGUF-ready (remapped) weights as safetensors in *save_dir*."""
+        remapped = self._remap_weights_for_gguf()
+        path = save_dir / "model.safetensors"
+        try:
+            from safetensors.torch import save_file
+            save_file(remapped, str(path))
+        except ImportError:
+            torch.save(remapped, str(path.with_suffix(".pt")))
+            logger.warning("safetensors not installed; saved remapped weights as .pt")
+        logger.info(f"Remapped weights → {path}")
+
+    def _save_llama_config(self, save_dir: Path) -> None:
+        """
+        Write a ``config.json`` in LlamaConfig format so that
+        ``convert_hf_to_gguf.py`` can parse the model's architecture without
+        manual flags.
+
+        Maps our ModelConfig fields to the expected LLaMA HF config keys.
+        """
+        cfg = self.model_cfg
+        llama_cfg = {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            # Dimensions
+            "hidden_size":            cfg.hidden_size,
+            "intermediate_size":      cfg.intermediate_size,
+            "num_hidden_layers":      cfg.num_layers,
+            "num_attention_heads":    cfg.num_heads,
+            "num_key_value_heads":    cfg.num_kv_heads,   # GQA support
+            "max_position_embeddings": cfg.max_seq_len,
+            "vocab_size":             cfg.vocab_size,
+            # Activations / norms
+            "hidden_act":             "silu",
+            "rms_norm_eps":           cfg.layer_norm_eps,
+            # RoPE
+            "rope_theta":             cfg.rope_theta,
+            "rope_scaling":           None,
+            # Misc
+            "tie_word_embeddings":    cfg.tie_embeddings,
+            "torch_dtype":            "bfloat16",
+            "transformers_version":   "4.40.0",
+            # Required by some versions of convert_hf_to_gguf.py
+            "bos_token_id": 2,
+            "eos_token_id": 2,
+            "pad_token_id": 0,
+        }
+        config_path = save_dir / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(llama_cfg, f, indent=2)
+        logger.info(f"LlamaConfig → {config_path}")
 
     def _find_llama_cpp_convert(self) -> Optional[Path]:
         """Look for llama.cpp's convert_hf_to_gguf.py in common locations."""
