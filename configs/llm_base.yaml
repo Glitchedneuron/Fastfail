@@ -1,0 +1,64 @@
+# FastFail LLM Base Configuration (~1 B parameters)
+model:
+  vocab_size: 32000
+  max_seq_len: 4096
+  hidden_size: 2048
+  num_layers: 22
+  num_heads: 16
+  num_kv_heads: 8          # GQA — 8 KV heads shared among 16 query heads
+  intermediate_size: 5632
+  dropout: 0.0
+  layer_norm_eps: 1.0e-5
+  rope_theta: 500000.0
+  tie_embeddings: true
+
+training:
+  seed: 42
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  learning_rate: 1.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  epsilon: 1.0e-8
+  max_grad_norm: 1.0
+  lr_scheduler: "cosine"
+  warmup_ratio: 0.03
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 16
+  num_train_epochs: 2
+  max_steps: -1
+  eval_steps: 500
+  save_steps: 1000
+  logging_steps: 50
+  save_total_limit: 2
+  train_split: 0.85
+  val_split: 0.10
+  test_split: 0.05
+
+lora:
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  bias: "none"
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+hpt:
+  n_trials: 20
+  timeout: 7200
+  sampler: "tpe"
+  pruner: "hyperband"
+
+export:
+  format: "safetensors"
+  output_dir: "exported_models"
+  quantize: true
+  quantize_bits: 4
